@@ -917,6 +917,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         var olderThanCursors: [String: Date] = [:]
         var anchorCursors: [String: HKQueryAnchor] = [:]
         var completedTypes: Set<String> = []
+        /// Lower bound for each unfinished type's "head" stream (arrivals since
+        /// the session began), so new data flows while the backfill crawls.
+        var headBound: Date?
         /// Sync run this state belongs to, so late callbacks can tell whether they are stale.
         let generation: Int
         /// Whether the caller already knows it runs in the background (BG tasks do).
@@ -948,6 +951,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         completion: @escaping (Bool) -> Void
     ) {
         let rrState = RoundRobinState(generation: generation, declaredBackground: isBackground)
+        
+        // Bound the concurrent head stream to arrivals since the session began,
+        // minus a margin for interval samples straddling the boundary (a sleep or
+        // workout that started before the session and ends inside it).
+        rrState.headBound = (loadSyncState()?.createdAt ?? Date()).addingTimeInterval(-48 * 3600)
         
         let resumeInfo = getResumeCursors()
         rrState.completedTypes = resumeInfo.completedTypes
@@ -986,6 +994,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let newAnchor: HKQueryAnchor?
         let anchorData: Data?
         let isDone: Bool
+        let isIncremental: Bool
     }
     
     // MARK: - Round-Robin with combined payloads
@@ -1008,11 +1017,27 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
         
         let chunkLimit = currentChunkLimit(declaredBackground: rrState.declaredBackground)
-        let perTypeLimit = max(1, chunkLimit / incompleteTypes.count)
-        
+
+        // During the initial full export, types whose backfill already completed
+        // keep flushing new samples via anchored incremental queries in the same
+        // rounds, so the history crawl does not block incremental sync.
+        var roundTypes = incompleteTypes
+        if fullExport {
+            for type in types where rrState.completedTypes.contains(type.identifier) && rrState.anchorCursors[type.identifier] == nil {
+                if let anchor = loadAnchor(for: type) {
+                    rrState.anchorCursors[type.identifier] = anchor
+                }
+            }
+            roundTypes += types.filter {
+                rrState.completedTypes.contains($0.identifier) && rrState.anchorCursors[$0.identifier] != nil
+            }
+        }
+
+        let perTypeLimit = max(1, chunkLimit / roundTypes.count)
+
         // Phase 1: Fetch one chunk from each type (no network yet)
         fetchTypesInRound(
-            types: incompleteTypes, index: 0, fullExport: fullExport,
+            types: roundTypes, index: 0, fullExport: fullExport,
             chunkLimit: perTypeLimit, rrState: rrState, accumulated: []
         ) { [weak self] success, results in
             guard let self = self else { completion(false); return }
@@ -1024,28 +1049,37 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             
             // Update cursors for types that aren't done
             for result in results where !result.isDone {
-                if fullExport {
+                if result.isIncremental {
+                    if let anchor = result.newAnchor {
+                        rrState.anchorCursors[result.type.identifier] = anchor
+                    }
+                } else {
                     rrState.olderThanCursors[result.type.identifier] = result.nextOlderThan
-                } else if let anchor = result.newAnchor {
-                    rrState.anchorCursors[result.type.identifier] = anchor
+                    // An unfinished type's anchorCursor holds its head stream,
+                    // which keeps advancing while the crawl runs.
+                    if let anchor = result.newAnchor {
+                        rrState.anchorCursors[result.type.identifier] = anchor
+                    }
                 }
             }
             
             // Mark empty/done types (no data to send) as complete immediately
             let emptyDone = results.filter { $0.samples.isEmpty && $0.isDone }
             for result in emptyDone {
-                if !fullExport {
+                if result.isIncremental {
                     self.updateTypeProgress(typeIdentifier: result.type.identifier, sentInChunk: 0, isComplete: true, anchorData: result.anchorData)
                 }
                 rrState.completedTypes.insert(result.type.identifier)
-                if fullExport { self.fireTypeCompletedLog(result.type.identifier) }
+                if fullExport && !result.isIncremental { self.fireTypeCompletedLog(result.type.identifier) }
             }
             
             // Phase 2: Build combined payload from all types that returned data
             let withData = results.filter { !$0.samples.isEmpty }
             let allSamples = withData.flatMap { $0.samples }
             
-            let doneTypesForAnchorCapture = results.filter { $0.isDone }.map { $0.type }
+            // Anchor capture walks history to position the incremental cursor;
+            // incremental results already carry the new anchor from their query.
+            let doneTypesForAnchorCapture = results.filter { $0.isDone && !$0.isIncremental }.map { $0.type }
             
             if allSamples.isEmpty {
                 if fullExport && !doneTypesForAnchorCapture.isEmpty {
@@ -1106,12 +1140,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
 
                     // Phase 3: Update progress for all types that had data
                     for result in withData {
-                        if fullExport {
-                            self.updateTypeProgress(
-                                typeIdentifier: result.type.identifier, sentInChunk: result.count,
-                                isComplete: false, anchorData: nil, olderThan: result.nextOlderThan
-                            )
-                        } else {
+                        if result.isIncremental {
                             self.updateTypeProgress(
                                 typeIdentifier: result.type.identifier, sentInChunk: result.count,
                                 isComplete: result.isDone, anchorData: result.anchorData
@@ -1119,11 +1148,18 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                             if result.isDone {
                                 rrState.completedTypes.insert(result.type.identifier)
                             }
+                        } else {
+                            // anchorData persists the head stream's position so a
+                            // paused session resumes the live tail mid-backfill.
+                            self.updateTypeProgress(
+                                typeIdentifier: result.type.identifier, sentInChunk: result.count,
+                                isComplete: false, anchorData: result.anchorData, olderThan: result.nextOlderThan
+                            )
                         }
                     }
 
                     // Phase 4: For full export, capture anchors for done types
-                    let fullExportDone = withData.filter { $0.isDone }.map { $0.type } + doneTypesForAnchorCapture.filter { t in !withData.contains(where: { $0.type == t }) }
+                    let fullExportDone = withData.filter { $0.isDone && !$0.isIncremental }.map { $0.type } + doneTypesForAnchorCapture.filter { t in !withData.contains(where: { $0.type == t }) }
                     if fullExport && !fullExportDone.isEmpty {
                         self.captureAnchorsForDoneTypes(types: fullExportDone, index: 0, rrState: rrState) { captureOk in
                             guard captureOk else { completion(false); return }
@@ -1213,22 +1249,40 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         let type = types[index]
         
-        if fullExport {
+        // In a full-export round, types whose backfill already completed fetch
+        // incrementally from their anchor; the rest crawl newest-first.
+        let incrementalFetch = !fullExport || rrState.completedTypes.contains(type.identifier)
+        if !incrementalFetch {
             let cursor = rrState.olderThanCursors[type.identifier]
             fetchOneChunkNewestFirst(type: type, olderThan: cursor, chunkLimit: chunkLimit, generation: rrState.generation) {
                 [weak self] success, samples, nextOlderThan, isDone in
                 guard let self = self else { completion(false, accumulated); return }
                 if !success { completion(false, accumulated); return }
                 
-                let result = TypeRoundResult(
-                    type: type, samples: samples, count: samples.count,
-                    nextOlderThan: nextOlderThan, newAnchor: nil, anchorData: nil, isDone: isDone
-                )
-                self.fetchTypesInRound(
-                    types: types, index: index + 1, fullExport: fullExport,
-                    chunkLimit: chunkLimit, rrState: rrState,
-                    accumulated: accumulated + [result], completion: completion
-                )
+                // The history crawl only walks backward. A concurrent anchored
+                // stream (bounded to arrivals since the session began) delivers
+                // new data while the crawl is still running, so incremental sync
+                // is never blocked on the backfill. The type completes only once
+                // both channels have drained.
+                self.fetchOneChunkIncremental(
+                    type: type, anchor: rrState.anchorCursors[type.identifier],
+                    chunkLimit: chunkLimit, generation: rrState.generation,
+                    startBound: rrState.headBound
+                ) { [weak self] headSuccess, headSamples, newAnchor, anchorData, headDrained in
+                    guard let self = self else { completion(false, accumulated); return }
+                    if !headSuccess { completion(false, accumulated); return }
+                    
+                    let result = TypeRoundResult(
+                        type: type, samples: samples + headSamples, count: samples.count + headSamples.count,
+                        nextOlderThan: nextOlderThan, newAnchor: newAnchor, anchorData: anchorData,
+                        isDone: isDone && headDrained, isIncremental: false
+                    )
+                    self.fetchTypesInRound(
+                        types: types, index: index + 1, fullExport: fullExport,
+                        chunkLimit: chunkLimit, rrState: rrState,
+                        accumulated: accumulated + [result], completion: completion
+                    )
+                }
             }
         } else {
             let anchor = rrState.anchorCursors[type.identifier]
@@ -1239,7 +1293,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 
                 let result = TypeRoundResult(
                     type: type, samples: samples, count: samples.count,
-                    nextOlderThan: nil, newAnchor: newAnchor, anchorData: anchorData, isDone: isDone
+                    nextOlderThan: nil, newAnchor: newAnchor, anchorData: anchorData, isDone: isDone,
+                    isIncremental: true
                 )
                 self.fetchTypesInRound(
                     types: types, index: index + 1, fullExport: fullExport,
@@ -1262,7 +1317,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
         
         let type = types[index]
-        captureCurrentAnchor(for: type) { [weak self] anchor in
+        // Continue from the head-stream anchor when the type has one: the stream
+        // already holds an insertion-order position, so capture only walks the
+        // remainder instead of re-reading all history - and no arrival between
+        // the stream's position and now can be skipped.
+        captureCurrentAnchor(for: type, startAnchor: rrState.anchorCursors[type.identifier]) { [weak self] anchor in
             guard let self = self else { completion(false); return }
             if self.isSyncCancelled(generation: rrState.generation) {
                 completion(false)
@@ -1344,12 +1403,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     private func fetchOneChunkIncremental(
         type: HKSampleType, anchor: HKQueryAnchor?, chunkLimit: Int, generation: Int,
+        startBound: Date? = nil,
         completion: @escaping (_ success: Bool, _ samples: [HKSample], _ newAnchor: HKQueryAnchor?, _ anchorData: Data?, _ isDone: Bool) -> Void
     ) {
         if isSyncCancelled(generation: generation) { completion(false, [], nil, nil, false); return }
         
         let syncPredicate: NSPredicate? = {
-            guard let start = syncStartDate() else { return nil }
+            guard let start = startBound ?? syncStartDate() else { return nil }
             return HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
         }()
         
@@ -1400,9 +1460,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     // MARK: - Anchor Capture (for incremental sync after full export)
     
-    private func captureCurrentAnchor(for type: HKSampleType, completion: @escaping (HKQueryAnchor?) -> Void) {
+    private func captureCurrentAnchor(for type: HKSampleType, startAnchor: HKQueryAnchor? = nil, completion: @escaping (HKQueryAnchor?) -> Void) {
         logMessage("  \(shortTypeName(type.identifier)): saving anchor...")
-        captureAnchorStep(type: type, anchor: nil, limit: 10000, completion: completion)
+        captureAnchorStep(type: type, anchor: startAnchor, limit: 10000, completion: completion)
     }
     
     private func captureAnchorStep(type: HKSampleType, anchor: HKQueryAnchor?, limit: Int, completion: @escaping (HKQueryAnchor?) -> Void) {
