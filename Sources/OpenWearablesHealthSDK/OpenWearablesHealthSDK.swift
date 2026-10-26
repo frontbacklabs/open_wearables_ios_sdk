@@ -954,8 +954,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         // Bound the concurrent head stream to arrivals since the session began,
         // minus a margin for interval samples straddling the boundary (a sleep or
-        // workout that started before the session and ends inside it).
-        rrState.headBound = (loadSyncState()?.createdAt ?? Date()).addingTimeInterval(-48 * 3600)
+        // workout that started before the session and ends inside it). Never bound
+        // below syncStartDate - the configured range must still be respected.
+        let headBound = (loadSyncState()?.createdAt ?? Date()).addingTimeInterval(-48 * 3600)
+        rrState.headBound = syncStartDate().map { max(headBound, $0) } ?? headBound
         
         let resumeInfo = getResumeCursors()
         rrState.completedTypes = resumeInfo.completedTypes
@@ -1033,7 +1035,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
         }
 
-        let perTypeLimit = max(1, chunkLimit / roundTypes.count)
+        // Every unfinished type also runs a head-channel fetch in a full-export
+        // round, so the per-fetch share of the chunk budget divides across
+        // channels, not just types - otherwise a round can upload ~2x its limit.
+        let headChannelCount = fullExport ? incompleteTypes.count : 0
+        let perTypeLimit = max(1, chunkLimit / (roundTypes.count + headChannelCount))
 
         // Phase 1: Fetch one chunk from each type (no network yet)
         fetchTypesInRound(
@@ -1054,7 +1060,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                         rrState.anchorCursors[result.type.identifier] = anchor
                     }
                 } else {
-                    rrState.olderThanCursors[result.type.identifier] = result.nextOlderThan
+                    // nextOlderThan is nil once the crawl finishes; a nil write
+                    // here would reset a head-draining type back to the newest.
+                    if let nextOlderThan = result.nextOlderThan {
+                        rrState.olderThanCursors[result.type.identifier] = nextOlderThan
+                    }
                     // An unfinished type's anchorCursor holds its head stream,
                     // which keeps advancing while the crawl runs.
                     if let anchor = result.newAnchor {
