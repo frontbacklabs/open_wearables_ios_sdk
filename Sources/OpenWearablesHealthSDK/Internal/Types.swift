@@ -1220,6 +1220,10 @@ extension OpenWearablesHealthSDK {
     
     // MARK: - Zone Offset
     
+    /// The zone the device falls back to when a sample carries no `HKMetadataKeyTimeZone`.
+    /// Overridable for tests only.
+    internal static var deviceTimeZone: () -> TimeZone = { TimeZone.current }
+
     private func _zoneOffsetString(metadata: [String: Any]?, fallback: [String: Any]? = nil, date: Date) -> Any {
         if let tzName = metadata?[HKMetadataKeyTimeZone] as? String,
            let tz = TimeZone(identifier: tzName) {
@@ -1229,7 +1233,10 @@ extension OpenWearablesHealthSDK {
            let tz = TimeZone(identifier: tzName) {
             return _formatZoneOffset(tz.secondsFromGMT(for: date))
         }
-        return NSNull()
+        // Most samples (iPhone and Watch steps, heart rate, energy) carry no zone. A null
+        // offset makes the backend bucket the sample by UTC day, so west of UTC the evening
+        // lands on tomorrow; the device's zone at the sample's date is the best local day.
+        return _formatZoneOffset(Self.deviceTimeZone().secondsFromGMT(for: date))
     }
     
     private func _formatZoneOffset(_ totalSeconds: Int) -> String {
