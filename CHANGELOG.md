@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.17.0+fbl.2
+
 * **Zone offset falls back to the device's zone** (Front Back Labs fork): `zoneOffset` was `null` for every sample without `HKMetadataKeyTimeZone`, which is most of them (iPhone and Apple Watch steps, heart rate, active energy). Open Wearables reads a missing offset as UTC, so west of UTC a day's evening samples were bucketed into the next day's totals, and each day's total was missing them. Such samples now carry the device's current zone offset at the sample's date (DST-aware). A sample recorded in another zone while travelling gets the current zone instead of its own. Already-uploaded samples are not re-sent and keep their `null` offset.
 
 ## 0.17.0+fbl.1
