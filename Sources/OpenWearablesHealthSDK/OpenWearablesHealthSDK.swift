@@ -42,7 +42,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Shared singleton instance.
     public static let shared = OpenWearablesHealthSDK()
     
-    internal static let sdkVersion = "0.17.0+fbl.1"
+    internal static let sdkVersion = "0.17.0+fbl.2"
     
     // MARK: - Public Callbacks
     
