@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* **Zone offset falls back to the device's zone** (Front Back Labs fork): `zoneOffset` was `null` for every sample without `HKMetadataKeyTimeZone`, which is most of them (iPhone and Apple Watch steps, heart rate, active energy). Open Wearables reads a missing offset as UTC, so west of UTC a day's evening samples were bucketed into the next day's totals, and each day's total was missing them. Such samples now carry the device's current zone offset at the sample's date (DST-aware). A sample recorded in another zone while travelling gets the current zone instead of its own. Already-uploaded samples are not re-sent and keep their `null` offset.
+
 ## 0.17.0+fbl.1
 
 * **Sync no longer stalls the host app's UI** (Front Back Labs fork): the work that follows each combined upload — a `SyncState` read and atomic write per type in the round, then the next round's setup — ran on the main queue, because the foreground session delivers there. On device that was 16–27 ms of file I/O on the main thread a few times a second for as long as a sync ran, which showed up as dropped frames while scrolling. It now continues on a private serial queue, like the HealthKit fetch callbacks that drive the rest of the loop. Upload outcome handling, cancellation and what a 2xx advances are unchanged. One observable contract change: a sync run's completion (`resumeSync`, `syncAll`) used to arrive on the main queue when the run ended through an upload; it now arrives on the serial queue, like every other path — treat sync callbacks as internal-queue deliveries and hop to main for UI work.
